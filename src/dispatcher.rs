@@ -172,34 +172,34 @@ fn model_list_shape(family: ApiFamily) -> Option<(&'static str, &'static str, &'
 ///
 /// Backends are queried without the client's headers (as health probes are),
 /// so a backend that demands its own credentials on this endpoint contributes
-/// nothing to the merge.
+/// nothing to the merge — except via its own configured `token`, which is
+/// attached like everywhere else.
 async fn aggregate_model_list(
     state: &AppState,
     family: ApiFamily,
 ) -> Option<axum::response::Response> {
     let (endpoint, array_key, id_field) = model_list_shape(family)?;
 
-    let urls: Vec<String> = state
+    let targets: Vec<(String, Option<String>)> = state
         .backends
         .lock_or_recover()
         .iter()
         .filter(|b| b.is_online && family_compatible(b, family))
-        .map(|b| b.url.clone())
+        .map(|b| (b.url.clone(), b.token.clone()))
         .collect();
-    if urls.is_empty() {
+    if targets.is_empty() {
         return None;
     }
 
-    let bodies = futures_util::future::join_all(urls.into_iter().map(|base| {
+    let bodies = futures_util::future::join_all(targets.into_iter().map(|(base, token)| {
         let client = state.client.clone();
         let url = format!("{}{}", base, endpoint);
         async move {
-            let res = client
-                .get(&url)
-                .timeout(crate::control::PROBE_TIMEOUT)
-                .send()
-                .await
-                .ok()?;
+            let mut req = client.get(&url).timeout(crate::control::PROBE_TIMEOUT);
+            if let Some(t) = &token {
+                req = req.header("Authorization", format!("Bearer {}", t));
+            }
+            let res = req.send().await.ok()?;
             if !res.status().is_success() {
                 return None;
             }
@@ -242,6 +242,24 @@ async fn aggregate_model_list(
     Some((StatusCode::OK, axum::Json(envelope)).into_response())
 }
 
+/// Insert the backend's configured auth token into `headers` unless the
+/// client already presented its own credentials (`Authorization` or
+/// `X-Api-Key`). Client-supplied headers are never overridden; a token that
+/// cannot be encoded as an HTTP header value is skipped rather than failing
+/// the request.
+fn attach_backend_token(headers: &mut HeaderMap, token: Option<&str>) {
+    let t = match token {
+        Some(t)
+            if !headers.contains_key(axum::http::header::AUTHORIZATION)
+                && !headers.contains_key("x-api-key") =>
+            t,
+        _ => return,
+    };
+    if let Ok(v) = format!("Bearer {}", t).parse() {
+        headers.insert(axum::http::header::AUTHORIZATION, v);
+    }
+}
+
 /// True for endpoints that only read backend metadata — no inference.
 ///
 /// These neither wait for a free slot nor occupy one: they don't touch the
@@ -270,6 +288,11 @@ pub struct LmModelInfo {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BackendStatus {
     pub url: String,
+    /// Optional API key for this backend (from appconf.yaml), sent as
+    /// `Authorization: Bearer <token>` on every request the proxy makes to
+    /// it — proxied inference, metadata reads, health probes and model
+    /// control ops. A client's own auth header is never overridden.
+    pub token: Option<String>,
     pub active_requests: usize,
     pub processed_count: usize,
     pub is_online: bool,
@@ -473,7 +496,7 @@ const MAX_LOG_CONTENT_EVENTS: usize = 100;
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        backend_urls: Vec<String>,
+        backends: Vec<(String, Option<String>)>,
         timeout: u64,
         load_keep_alive: i64,
         stuck_timeout_secs: u64,
@@ -485,10 +508,11 @@ impl AppState {
         max_queued_bytes: u64,
     ) -> Self {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
-        let backends = backend_urls
+        let backends = backends
             .into_iter()
-            .map(|url| BackendStatus {
+            .map(|(url, token)| BackendStatus {
                 url,
+                token,
                 active_requests: 0,
                 processed_count: 0,
                 is_online: true,
@@ -954,6 +978,10 @@ fn prune_idle_users(state: &AppState, retention: std::time::Duration) {
 /// round — combined with the probe timeout (see [`crate::control::PROBE_TIMEOUT`])
 /// that could stall the loop for minutes while the scheduler routed on stale
 /// online/loaded state.
+/// One backend to probe in a health round: (index, url, token,
+/// was_online, known-bad endpoints to skip).
+type ProbeTarget = (usize, String, Option<String>, bool, HashSet<String>);
+
 async fn health_check_round(
     state: &Arc<AppState>,
     client: &reqwest::Client,
@@ -961,7 +989,7 @@ async fn health_check_round(
     probe_timeout: std::time::Duration,
 ) {
     // Snapshot what to probe, and which endpoints to skip, in one lock pass.
-    let to_check: Vec<(usize, String, bool, HashSet<String>)> = {
+    let to_check: Vec<ProbeTarget> = {
         let backends = state.backends.lock_or_recover();
         backends
             .iter()
@@ -980,17 +1008,23 @@ async fn health_check_round(
                     }
                     s
                 };
-                (i, b.url.clone(), b.is_online, skip)
+                (i, b.url.clone(), b.token.clone(), b.is_online, skip)
             })
             .collect()
     };
 
     let probes = futures_util::future::join_all(to_check.into_iter().map(
-        |(idx, url, was_online, skip)| {
+        |(idx, url, token, was_online, skip)| {
             let client = client.clone();
             async move {
-                let probe =
-                    crate::control::probe_backend(&client, &url, &skip, probe_timeout).await;
+                let probe = crate::control::probe_backend(
+                    &client,
+                    &url,
+                    token.as_deref(),
+                    &skip,
+                    probe_timeout,
+                )
+                .await;
                 (idx, url, was_online, probe)
             }
         },
@@ -1188,7 +1222,14 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // the FIRST routable task (not just the front) so an
                 // unroutable request — e.g. an Ollama-family call with every
                 // Ollama backend offline — can't starve everything behind it.
-                let mut selection: Option<(String, Task, usize, String, bool)> = None;
+                let mut selection: Option<(
+                    String,
+                    Task,
+                    usize,
+                    String,
+                    Option<String>,
+                    bool,
+                )> = None;
                 'users: for &ui in &order {
                     let user_id = &active_users[ui];
                     let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
@@ -1535,6 +1576,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             task,
                             selected_backend_idx,
                             backends[selected_backend_idx].url.clone(),
+                            backends[selected_backend_idx].token.clone(),
                             metadata,
                         ));
                         break 'users;
@@ -1546,7 +1588,7 @@ pub async fn run_worker(state: Arc<AppState>) {
         };
 
         match selection_opt {
-            Some((user_id, task, backend_idx, backend_url, metadata)) => {
+            Some((user_id, task, backend_idx, backend_url, backend_token, metadata)) => {
                 let state_clone = state.clone();
                 let client_clone = client.clone();
                 let url = format!("{}{}", backend_url, task.path);
@@ -1609,9 +1651,14 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let method_str = task.method.to_string();
                         let path_str = task.path.clone();
 
+                        // Attach this backend's configured auth token unless the
+                        // client already presented its own credentials.
+                        let mut headers = task.headers.clone();
+                        attach_backend_token(&mut headers, backend_token.as_deref());
+
                         let res_fut = client_clone
                             .request(task.method, &url)
-                            .headers(task.headers)
+                            .headers(headers)
                             .body(task.body)
                             .send();
 
@@ -2172,6 +2219,7 @@ mod tests {
     fn backend_with(api_type: BackendApiType, rejected: &[ApiFamily]) -> BackendStatus {
         BackendStatus {
             url: "http://test".into(),
+            token: None,
             active_requests: 0,
             processed_count: 0,
             is_online: true,
@@ -2397,7 +2445,7 @@ mod tests {
     async fn stuck_request_fails_fast_with_503() {
         // Backend that can never serve the requested model (nothing listens).
         let state = Arc::new(AppState::new(
-            vec!["http://127.0.0.1:9".to_string()],
+            vec![("http://127.0.0.1:9".to_string(), None)],
             5,     // request timeout
             86400, // load keep alive
             1,     // stuck_timeout: fail fast after 1s
@@ -2440,6 +2488,143 @@ mod tests {
         }
 
         worker.abort();
+    }
+
+    /// Backend mock that records `(path, Authorization header)` for every
+    /// request and answers 200. `/api/tags` returns an Ollama-style listing
+    /// so the health probes keep `llama3` available on it.
+    #[allow(clippy::type_complexity)]
+    async fn spawn_recording_backend() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+    ) {
+        let calls: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording backend");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("mock local addr")
+        );
+        let c = calls.clone();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/{*path}",
+                axum::routing::any(move |uri: axum::extract::OriginalUri, headers: HeaderMap| {
+                    let c = c.clone();
+                    async move {
+                        let path = uri.0.path().to_string();
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        c.lock_or_recover().push((path.clone(), auth));
+                        if path == "/api/tags" {
+                            axum::Json(serde_json::json!({ "models": [{ "name": "llama3" }] }))
+                        } else {
+                            axum::Json(serde_json::json!({ "ok": true }))
+                        }
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, calls)
+    }
+
+    /// Enqueue one `POST /api/chat` request for `llama3` under user "tester"
+    /// with the given client headers. Returns the receiver — keep it alive
+    /// so the worker doesn't drop the request as client-gone.
+    fn enqueue_llama_chat(
+        state: &Arc<AppState>,
+        headers: HeaderMap,
+    ) -> mpsc::Receiver<ResponsePart> {
+        let (tx, rx) = mpsc::channel(32);
+        let body = Bytes::from(r#"{"model":"llama3","messages":[]}"#);
+        state
+            .queued_bytes
+            .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        state
+            .queues
+            .lock_or_recover()
+            .entry("tester".to_string())
+            .or_default()
+            .push_back(Task {
+                method: Method::POST,
+                user: "127.0.0.1:41000".to_string(),
+                path: "/api/chat".into(),
+                headers,
+                body,
+                responder: tx,
+                requested_model: Some("llama3".to_string()),
+                stuck_warned: false,
+                queued_at: std::time::Instant::now(),
+            });
+        rx
+    }
+
+    /// Mark the single test backend as an online Ollama that lists `llama3`
+    /// (the state its mock's probe answers produce), with the given token.
+    fn arm_ollama_backend(state: &Arc<AppState>, token: Option<String>) {
+        let mut backends = state.backends.lock_or_recover();
+        backends[0].token = token;
+        backends[0].is_online = true;
+        backends[0].api_type = BackendApiType::Ollama;
+        backends[0].available_models = Arc::new(set(&["llama3"]));
+    }
+
+    /// The configured backend token is attached to proxied requests that carry
+    /// no client credentials of their own.
+    #[tokio::test]
+    async fn proxy_attaches_configured_backend_token() {
+        let (url, calls) = spawn_recording_backend().await;
+        let state = new_test_state(vec![url.clone()]);
+        arm_ollama_backend(&state, Some("sekrit".to_string()));
+
+        let _rx = enqueue_llama_chat(&state, HeaderMap::new());
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 0);
+        wait_for_completion(&state, picked).await;
+        worker.abort();
+
+        let calls = calls.lock_or_recover().clone();
+        let chat: Vec<_> = calls.into_iter().filter(|(p, _)| p == "/api/chat").collect();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].1.as_deref(), Some("Bearer sekrit"));
+    }
+
+    /// A client's own Authorization header is forwarded untouched — the
+    /// configured backend token must not override it.
+    #[tokio::test]
+    async fn proxy_does_not_override_client_auth_header() {
+        let (url, calls) = spawn_recording_backend().await;
+        let state = new_test_state(vec![url.clone()]);
+        arm_ollama_backend(&state, Some("sekrit".to_string()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer client-key".parse().expect("valid header value"),
+        );
+        let _rx = enqueue_llama_chat(&state, headers);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 0);
+        wait_for_completion(&state, picked).await;
+        worker.abort();
+
+        let calls = calls.lock_or_recover().clone();
+        let chat: Vec<_> = calls.into_iter().filter(|(p, _)| p == "/api/chat").collect();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].1.as_deref(), Some("Bearer client-key"));
     }
 
     // -- Scheduler-tier integration tests ------------------------------------
@@ -2566,8 +2751,9 @@ mod tests {
     }
 
     fn new_test_state_with_budget(urls: Vec<String>, max_queued_bytes: u64) -> Arc<AppState> {
+        let backends = urls.into_iter().map(|u| (u, None)).collect();
         Arc::new(AppState::new(
-            urls,
+            backends,
             5,     // request timeout
             86400, // load keep alive
             1,     // stuck_timeout: fail fast after 1s
@@ -3422,8 +3608,9 @@ mod tests {
     /// pre-busy backend (active_requests = 1) still has capacity for the
     /// enqueued request (same shape as new_test_state).
     fn new_test_state_cap(urls: Vec<String>, cap: u32) -> Arc<AppState> {
+        let backends = urls.into_iter().map(|u| (u, None)).collect();
         Arc::new(AppState::new(
-            urls,
+            backends,
             5,     // request timeout
             86400, // load keep alive
             1,     // stuck_timeout: fail fast after 1s

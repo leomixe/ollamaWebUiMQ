@@ -143,6 +143,17 @@ async fn auth_middleware(
     }
 }
 
+/// Normalize a backend URL from the CLI or config: strip trailing slashes
+/// and add `http://` when no scheme is given.
+fn normalize_backend_url(url: String) -> String {
+    let trimmed = url.trim_end_matches('/').to_string();
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        format!("http://{}", trimmed)
+    } else {
+        trimmed
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -210,25 +221,22 @@ async fn main() {
         .unwrap_or(512 * 1024 * 1024);
     let allow_all_routes = args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
 
-    let backend_urls: Vec<String> = args
-        .backend_urls
-        .unwrap_or_else(|| {
-            if file_cfg.backends.is_empty() {
-                vec!["http://localhost:11434".to_string()]
-            } else {
-                file_cfg.backends.clone()
-            }
-        })
-        .iter()
-        .map(|url| {
-            let trimmed = url.trim_end_matches('/').to_string();
-            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-                format!("http://{}", trimmed)
-            } else {
-                trimmed
-            }
-        })
-        .collect();
+    // (url, optional auth token) per backend. The CLI --backend-urls always
+    // wins; tokens only come from appconf.yaml.
+    let backends: Vec<(String, Option<String>)> = if let Some(urls) = args.backend_urls {
+        urls.into_iter().map(|u| (normalize_backend_url(u), None)).collect()
+    } else if file_cfg.backends.is_empty() {
+        vec![(
+            normalize_backend_url("http://localhost:11434".to_string()),
+            None,
+        )]
+    } else {
+        file_cfg
+            .backends
+            .into_iter()
+            .map(|b| (normalize_backend_url(b.url), b.token))
+            .collect()
+    };
 
     // Determine if we should run TUI
     let use_tui = !args.no_tui && std::io::stdout().is_terminal();
@@ -274,7 +282,7 @@ async fn main() {
         };
 
     let state = Arc::new(AppState::new(
-        backend_urls,
+        backends,
         timeout,
         load_keep_alive,
         stuck_timeout,

@@ -10,8 +10,9 @@
 //!
 //! ```yaml
 //! backends:
-//!   - http://10.137.1.1:11434
-//!   - http://10.137.1.2:11434
+//!   - http://10.137.1.1:11434          # plain URL — no auth
+//!   - url: http://10.137.1.2:11434     # object form with an optional token,
+//!     token: "sekrit"                  # sent as `Authorization: Bearer <token>`
 //!
 //! settings:
 //!   port: 11435
@@ -89,12 +90,54 @@ pub struct Settings {
     pub max_queued_bytes: Option<u64>,
 }
 
+/// One backend entry from the `backends:` list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Backend {
+    /// The backend's base URL (scheme included).
+    pub url: String,
+    /// Optional API key sent to this backend as
+    /// `Authorization: Bearer <token>` on every request the proxy makes to
+    /// it — proxied inference, model listings and metadata reads, health
+    /// probes, and model load/unload control ops. A client's own auth header
+    /// is never overridden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// YAML shape of one `backends:` entry: either a bare URL string or an object
+/// with `url` and optional `token`. Both forms are accepted so existing
+/// configs keep working unchanged.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BackendEntrySpec {
+    Url(String),
+    Full(Backend),
+}
+
+fn de_backends<'de, D>(d: D) -> Result<Vec<Backend>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let specs = Vec::<BackendEntrySpec>::deserialize(d)?;
+    Ok(specs
+        .into_iter()
+        .map(|spec| match spec {
+            BackendEntrySpec::Url(url) => Backend { url, token: None },
+            BackendEntrySpec::Full(b) => b,
+        })
+        .collect())
+}
+
 /// Top-level config file structure.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// Backend URLs to connect to (CLI `--backend-urls` wins when given).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub backends: Vec<String>,
+    /// Backends to connect to (CLI `--backend-urls` wins when given).
+    #[serde(
+        default,
+        deserialize_with = "de_backends",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub backends: Vec<Backend>,
     /// Runtime settings.
     #[serde(default)]
     pub settings: Settings,
@@ -210,6 +253,38 @@ models:
         assert_eq!(cfg.models[0].keep_alive, Some(3600));
         assert_eq!(cfg.models[0].max_concurrent_requests, 3);
         assert_eq!(cfg.models[0].backends.len(), 1);
+    }
+
+    #[test]
+    fn parse_backends_plain_and_token_forms() {
+        let yaml = r#"
+backends:
+  - http://10.137.1.1:11434
+  - url: http://10.137.1.2:11434
+    token: "sekrit"
+  - url: http://10.137.1.5:1234
+"#;
+        let tmp = std::env::temp_dir().join("ollamamq_test_backends.yaml");
+        std::fs::write(&tmp, yaml).unwrap();
+        let cfg = load_config(tmp.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.backends.len(), 3);
+        // Bare string: no token.
+        assert_eq!(cfg.backends[0].url, "http://10.137.1.1:11434");
+        assert_eq!(cfg.backends[0].token, None);
+        // Object with a token.
+        assert_eq!(cfg.backends[1].url, "http://10.137.1.2:11434");
+        assert_eq!(cfg.backends[1].token.as_deref(), Some("sekrit"));
+        // Object without a token is valid too.
+        assert_eq!(cfg.backends[2].url, "http://10.137.1.5:1234");
+        assert_eq!(cfg.backends[2].token, None);
+    }
+
+    #[test]
+    fn backend_object_without_url_is_rejected() {
+        let yaml = "backends:\n  - token: \"sekrit\"\n";
+        let tmp = std::env::temp_dir().join("ollamamq_test_backend_bad.yaml");
+        std::fs::write(&tmp, yaml).unwrap();
+        assert!(load_config(tmp.to_str().unwrap()).is_err());
     }
 
     #[test]

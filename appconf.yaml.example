@@ -17,10 +17,16 @@
 # each entry waits (up to 5 minutes) for that backend to go idle first.
 
 # --- Backends ollamaMQ connects to (same as --backend-urls) -----------------
+# Each entry is either a plain URL, or an object with `url` plus an optional
+# `token`. The token is sent to that backend as `Authorization: Bearer <token>`
+# on every request the proxy makes to it — proxied inference, model listings,
+# health probes and model load/unload. A client's own Authorization header is
+# always forwarded untouched (the token only fills in when none was provided).
 backends:
-  - http://10.137.1.1:11434    # Ollama
-  - http://10.137.1.2:11434    # Ollama
-  - http://10.137.1.5:1234     # LM Studio
+  - http://10.137.1.1:11434        # Ollama — no auth needed
+  - url: http://10.137.1.2:11434   # object form, e.g. for a backend behind an
+    token: "some-api-key"          #   authenticated reverse proxy (LM Studio, vLLM, ...)
+  - http://10.137.1.5:1234         # LM Studio
 
 # --- Runtime settings -------------------------------------------------------
 settings:

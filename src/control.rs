@@ -150,9 +150,13 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// `timeout` bounds every individual HTTP request made here (see
 /// [`PROBE_TIMEOUT`]); it is a parameter so tests can drive it down.
+///
+/// `token`, when set, is sent as `Authorization: Bearer <token>` on every
+/// request made here.
 pub async fn probe_backend(
     client: &reqwest::Client,
     url: &str,
+    token: Option<&str>,
     skip: &HashSet<String>,
     timeout: Duration,
 ) -> BackendProbe {
@@ -166,10 +170,16 @@ pub async fn probe_backend(
     let mut bad_endpoints: HashSet<String> = HashSet::new();
     let mut good_endpoints: HashSet<String> = HashSet::new();
 
+    // Every request here carries the backend's configured token when one is set.
+    let authed = |req: reqwest::RequestBuilder| match token {
+        Some(t) => req.header("Authorization", format!("Bearer {}", t)),
+        None => req,
+    };
+
     // Probe Ollama API: /api/tags → expects {"models": [...]}
     if !skip.contains("/api/tags") {
         let check_url = format!("{}/api/tags", url);
-        match client.get(&check_url).timeout(timeout).send().await {
+        match authed(client.get(&check_url).timeout(timeout)).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
                 let body = res.text().await.unwrap_or_default();
@@ -217,7 +227,7 @@ pub async fn probe_backend(
         // Also check for loaded models via /api/ps if it was an Ollama-like response
         if is_online && !skip.contains("/api/ps") {
             let ps_url = format!("{}/api/ps", url);
-            match client.get(&ps_url).timeout(timeout).send().await {
+            match authed(client.get(&ps_url).timeout(timeout)).send().await {
                 Ok(res) if res.status().is_success() => {
                     let body = res.text().await.unwrap_or_default();
                     match serde_json::from_str::<serde_json::Value>(&body)
@@ -264,7 +274,7 @@ pub async fn probe_backend(
 // Probe OpenAI API: /v1/models → expects {"data": [...]}
     if !skip.contains("/v1/models") {
         let check_url = format!("{}/v1/models", url);
-        match client.get(&check_url).timeout(timeout).send().await {
+        match authed(client.get(&check_url).timeout(timeout)).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
                 let body = res.text().await.unwrap_or_default();
@@ -311,7 +321,7 @@ pub async fn probe_backend(
     // generic OpenAI servers 404 it. The outcome is remembered so we stop
     // re-probing backends that don't have the endpoint.
         if !skip.contains("/api/v1/models") {
-            match probe_lmstudio_native(client, url, timeout).await {
+            match probe_lmstudio_native(client, url, token, timeout).await {
                 NativeProbeOutcome::Found(ls_loaded, ls_native, ls_ctx) => {
                     lmstudio = true;
                     native_models = ls_native;
@@ -331,7 +341,7 @@ pub async fn probe_backend(
     // Fallback: just check root if both specific probes failed
     if !is_online && !skip.contains("/") {
         let check_url = format!("{}/", url);
-        match client.get(&check_url).timeout(timeout).send().await {
+        match authed(client.get(&check_url).timeout(timeout)).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
                 good_endpoints.insert("/".to_string());
@@ -403,13 +413,14 @@ enum NativeProbeOutcome {
 async fn probe_lmstudio_native(
     client: &reqwest::Client,
     url: &str,
+    token: Option<&str>,
     timeout: Duration,
 ) -> NativeProbeOutcome {
-    let res = match client
-        .get(format!("{}/api/v1/models", url))
-        .timeout(timeout)
-        .send()
-        .await
+    let mut req = client.get(format!("{}/api/v1/models", url)).timeout(timeout);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    let res = match req.send().await
     {
         Ok(r) => r,
         Err(_) => return NativeProbeOutcome::Unknown,
@@ -677,15 +688,21 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                 // the model is already resident — e.g. loaded by a previous
                 // ollamaMQ run with long keep_alive — skip it instead of loading
                 // it twice.
-                let url = st
+                let (url, token) = st
                     .backends
                     .lock_or_recover()
                     .get(backend_idx)
-                    .map(|b| b.url.clone())
+                    .map(|b| (b.url.clone(), b.token.clone()))
                     .unwrap_or_default();
                 if !url.is_empty() {
-                    let probe =
-                        probe_backend(&st.client, &url, &HashSet::new(), PROBE_TIMEOUT).await;
+                    let probe = probe_backend(
+                        &st.client,
+                        &url,
+                        token.as_deref(),
+                        &HashSet::new(),
+                        PROBE_TIMEOUT,
+                    )
+                    .await;
                     let mut backends = st.backends.lock_or_recover();
                     if let Some(b) = backends.get_mut(backend_idx) {
                         apply_probe(b, probe);
@@ -735,6 +752,11 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                                 ),
                                 content: None,
                             });
+                            let token = st
+                                .backends
+                                .lock_or_recover()
+                                .get(backend_idx)
+                                .and_then(|b| b.token.clone());
                             let canonical = {
                                 let backends = st.backends.lock_or_recover();
                                 backends
@@ -745,6 +767,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                                 if let Err(e) = execute_unload(
                                     &st.client,
                                     &url,
+                                    token.as_deref(),
                                     lmstudio,
                                     &canonical,
                                     control_timeout,
@@ -756,9 +779,14 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                                 }
                                 // Give the backend a moment to release the model.
                                 tokio::time::sleep(Duration::from_secs(1)).await;
-                                let probe =
-                                    probe_backend(&st.client, &url, &HashSet::new(), PROBE_TIMEOUT)
-                                        .await;
+                                let probe = probe_backend(
+                                    &st.client,
+                                    &url,
+                                    token.as_deref(),
+                                    &HashSet::new(),
+                                    PROBE_TIMEOUT,
+                                )
+                                .await;
                                 let mut backends = st.backends.lock_or_recover();
                                 if let Some(b) = backends.get_mut(backend_idx) {
                                     apply_probe(b, probe);
@@ -837,9 +865,11 @@ pub fn reload_model_config(state: &Arc<AppState>) -> Result<usize, String> {
     Ok(n)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_load(
     client: &reqwest::Client,
     url: &str,
+    token: Option<&str>,
     lmstudio: bool,
     canonical: &str,
     control_timeout: Duration,
@@ -851,10 +881,14 @@ async fn execute_load(
         if let Some(num_ctx) = options.num_ctx {
             body["context_length"] = json!(num_ctx);
         }
-        let res = client
+        let mut req = client
             .post(format!("{}/api/v1/models/load", url))
             .timeout(control_timeout)
-            .json(&body)
+            .json(&body);
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {}", t));
+        }
+        let res = req
             .send()
             .await
             .map_err(|e| format!("request failed: {}", e))?;
@@ -882,10 +916,14 @@ async fn execute_load(
         if let Some(num_ctx) = options.num_ctx {
             body["options"] = json!({ "num_ctx": num_ctx });
         }
-        let res = client
+        let mut req = client
             .post(format!("{}/api/generate", url))
             .timeout(control_timeout)
-            .json(&body)
+            .json(&body);
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {}", t));
+        }
+        let res = req
             .send()
             .await
             .map_err(|e| format!("request failed: {}", e))?;
@@ -901,13 +939,15 @@ async fn execute_load(
 async fn fetch_lmstudio_instance_id(
     client: &reqwest::Client,
     url: &str,
+    token: Option<&str>,
     canonical: &str,
     control_timeout: Duration,
 ) -> Result<String, String> {
-    let res = client
-        .get(format!("{}/api/v1/models", url))
-        .timeout(control_timeout)
-        .send()
+    let mut req = client.get(format!("{}/api/v1/models", url)).timeout(control_timeout);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    let res = req.send()
         .await
         .map_err(|e| format!("request failed: {}", e))?;
     let body = res
@@ -945,6 +985,7 @@ async fn fetch_lmstudio_instance_id(
 async fn execute_unload(
     client: &reqwest::Client,
     url: &str,
+    token: Option<&str>,
     lmstudio: bool,
     canonical: &str,
     control_timeout: Duration,
@@ -959,14 +1000,21 @@ async fn execute_unload(
             .and_then(|m| m.loaded_instance_ids.first().cloned())
         {
             Some(id) => id,
-            None => fetch_lmstudio_instance_id(client, url, canonical, control_timeout).await?,
+            None => {
+                fetch_lmstudio_instance_id(client, url, token, canonical, control_timeout)
+                    .await?
+            }
         };
 
         let body = json!({ "instance_id": instance_id });
-        let res = client
+        let mut req = client
             .post(format!("{}/api/v1/models/unload", url))
             .timeout(control_timeout)
-            .json(&body)
+            .json(&body);
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {}", t));
+        }
+        let res = req
             .send()
             .await
             .map_err(|e| format!("request failed: {}", e))?;
@@ -988,10 +1036,14 @@ async fn execute_unload(
             "stream": false,
             "keep_alive": 0,
         });
-        let res = client
+        let mut req = client
             .post(format!("{}/api/generate", url))
             .timeout(control_timeout)
-            .json(&body)
+            .json(&body);
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {}", t));
+        }
+        let res = req
             .send()
             .await
             .map_err(|e| format!("request failed: {}", e))?;
@@ -1137,11 +1189,12 @@ pub fn start_model_control(
     };
     tokio::spawn(async move {
         let canonical = op_model;
-        let (backend_url, lmstudio, timeout, keep_alive, cached_native) = {
+        let (backend_url, token, lmstudio, timeout, keep_alive, cached_native) = {
             let backends = state.backends.lock_or_recover();
             let b = &backends[backend_idx];
             (
                 b.url.clone(),
+                b.token.clone(),
                 b.lmstudio,
                 state.timeout,
                 load_options.keep_alive.unwrap_or(state.load_keep_alive),
@@ -1155,6 +1208,7 @@ pub fn start_model_control(
             execute_load(
                 &state.client,
                 &backend_url,
+                token.as_deref(),
                 lmstudio,
                 &canonical,
                 control_timeout,
@@ -1166,6 +1220,7 @@ pub fn start_model_control(
             execute_unload(
                 &state.client,
                 &backend_url,
+                token.as_deref(),
                 lmstudio,
                 &canonical,
                 control_timeout,
@@ -1211,8 +1266,14 @@ pub fn start_model_control(
             }
         }
 
-        let probe =
-            probe_backend(&state.client, &backend_url, &HashSet::new(), PROBE_TIMEOUT).await;
+        let probe = probe_backend(
+            &state.client,
+            &backend_url,
+            token.as_deref(),
+            &HashSet::new(),
+            PROBE_TIMEOUT,
+        )
+        .await;
         {
             let mut backends = state.backends.lock_or_recover();
             if let Some(b) = backends.get_mut(backend_idx) {
@@ -1443,6 +1504,7 @@ mod tests {
     ) -> BackendStatus {
         BackendStatus {
             url: "http://test:11434".into(),
+            token: None,
             active_requests: 0,
             processed_count: 0,
             is_online: true,
@@ -1553,8 +1615,14 @@ mod tests {
             .expect("build client");
 
         let started = std::time::Instant::now();
-        let probe =
-            probe_backend(&client, &url, &HashSet::new(), Duration::from_millis(200)).await;
+        let probe = probe_backend(
+            &client,
+            &url,
+            None,
+            &HashSet::new(),
+            Duration::from_millis(200),
+        )
+        .await;
         let elapsed = started.elapsed();
         acceptor.abort();
 
@@ -1704,7 +1772,14 @@ mod tests {
     async fn probe_detects_ollama_and_lmstudio() {
         let (url, _calls) = start_mock_backend().await;
         let client = reqwest::Client::new();
-        let probe = probe_backend(&client, &url, &HashSet::new(), PROBE_TIMEOUT).await;
+        let probe = probe_backend(
+            &client,
+            &url,
+            None,
+            &HashSet::new(),
+            PROBE_TIMEOUT,
+        )
+        .await;
 
         assert!(probe.is_online);
         // This mock speaks both Ollama and LM Studio -> Both + lmstudio flag
@@ -1761,7 +1836,14 @@ mod tests {
 
         let client = reqwest::Client::new();
         // Full probe: both rejection styles are remembered as bad.
-        let probe = probe_backend(&client, &url, &HashSet::new(), PROBE_TIMEOUT).await;
+        let probe = probe_backend(
+            &client,
+            &url,
+            None,
+            &HashSet::new(),
+            PROBE_TIMEOUT,
+        )
+        .await;
         assert!(probe.is_online);
         assert!(probe.good_endpoints.contains("/api/tags"));
         assert!(probe.bad_endpoints.contains("/api/ps"), "200+error body must be bad");
@@ -1770,7 +1852,7 @@ mod tests {
         // Second probe skipping the bad endpoints: they are not hit again,
         // while good endpoints stay fresh.
         let skip = probe.bad_endpoints.clone();
-        let probe2 = probe_backend(&client, &url, &skip, PROBE_TIMEOUT).await;
+        let probe2 = probe_backend(&client, &url, None, &skip, PROBE_TIMEOUT).await;
         assert_eq!(extra_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(probe2.good_endpoints.contains("/api/tags"));
     }
@@ -1825,6 +1907,7 @@ mod tests {
         execute_load(
             &client,
             &url,
+            None,
             false,
             "llama3:latest",
             to,
@@ -1834,7 +1917,7 @@ mod tests {
         .await
         .unwrap();
         // Unload: empty-prompt generate with keep_alive 0
-        execute_unload(&client, &url, false, "llama3:latest", to, &[])
+        execute_unload(&client, &url, None, false, "llama3:latest", to, &[])
             .await
             .unwrap();
 
@@ -1859,7 +1942,16 @@ mod tests {
             keep_alive: Some(3600),
             identifier: Some("big-ctx".into()),
         };
-        execute_load(&client, &url, false, "llama3:latest", to, 86400, &options)
+        execute_load(
+            &client,
+            &url,
+            None,
+            false,
+            "llama3:latest",
+            to,
+            86400,
+            &options
+        )
             .await
             .unwrap();
 
@@ -1880,7 +1972,16 @@ mod tests {
             num_ctx: Some(8192),
             ..LoadOptions::default()
         };
-        execute_load(&client, &url, true, "mock/qwen2-7b", to, 86400, &options)
+        execute_load(
+            &client,
+            &url,
+            None,
+            true,
+            "mock/qwen2-7b",
+            to,
+            86400,
+            &options
+        )
             .await
             .unwrap();
 
@@ -1897,10 +1998,19 @@ mod tests {
         let client = reqwest::Client::new();
         let to = Duration::from_secs(5);
 
-        execute_load(&client, &url, true, "mock/qwen2-7b", to, 86400, &LoadOptions::default())
-            .await
-            .unwrap();
-        execute_unload(&client, &url, true, "mock/qwen2-7b", to, &[])
+        execute_load(
+            &client,
+            &url,
+            None,
+            true,
+            "mock/qwen2-7b",
+            to,
+            86400,
+            &LoadOptions::default()
+        )
+        .await
+        .unwrap();
+        execute_unload(&client, &url, None, true, "mock/qwen2-7b", to, &[])
             .await
             .unwrap();
 
@@ -1920,7 +2030,15 @@ mod tests {
             display_name: None,
             loaded_instance_ids: vec!["cached-instance".into()],
         }];
-        execute_unload(&client, &url, true, "mock/qwen2-7b", to, &cached)
+        execute_unload(
+            &client,
+            &url,
+            None,
+            true,
+            "mock/qwen2-7b",
+            to,
+            &cached
+        )
             .await
             .unwrap();
         {
@@ -1961,7 +2079,7 @@ mod tests {
     async fn apply_model_config_skips_resident_models() {
         let (url, calls) = start_mock_backend().await;
         let state = Arc::new(AppState::new(
-            vec![url.clone()],
+            vec![(url.clone(), None)],
             30,
             86400,
             60,
@@ -2011,7 +2129,7 @@ mod tests {
     async fn apply_model_config_reloads_resident_model_with_wrong_ctx() {
         let (url, calls) = start_mock_backend().await;
         let state = Arc::new(AppState::new(
-            vec![url.clone()],
+            vec![(url.clone(), None)],
             30,
             86400,
             60,
@@ -2077,9 +2195,9 @@ mod tests {
     async fn config_targets_match_every_selected_backend() {
         let state = AppState::new(
             vec![
-                "http://10.0.0.1:11434".into(),
-                "http://10.0.0.2:11434".into(),
-                "http://10.0.0.3:1234".into(),
+                ("http://10.0.0.1:11434".into(), None),
+                ("http://10.0.0.2:11434".into(), None),
+                ("http://10.0.0.3:1234".into(), None),
             ],
             30,
             86400,
@@ -2121,11 +2239,56 @@ mod tests {
         assert!(config_targets(&state, &cfg(vec!["".into()])).is_empty());
     }
 
+    /// A configured backend token is sent with health probes: without it the
+    /// auth-gated mock answers 401 and reads as offline; with it the same
+    /// backend is online and Ollama-typed.
+    #[tokio::test]
+    async fn probe_sends_configured_token() {
+        let app = Router::new().route(
+            "/api/tags",
+            get(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    == Some("Bearer sekrit")
+                {
+                    Json(json!({ "models": [{ "name": "llama3" }]})).into_response()
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": "unauthorized" })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // No token: every probe request gets 401/404 -> offline.
+        let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
+        assert!(!probe.is_online);
+
+        // With the token: online and Ollama-typed with its model listed.
+        let probe =
+            probe_backend(&client, &url, Some("sekrit"), &HashSet::new(), PROBE_TIMEOUT).await;
+        assert!(probe.is_online);
+        assert_eq!(probe.api_type, BackendApiType::Ollama);
+        assert!(probe.available_models.contains("llama3"));
+    }
+
     #[tokio::test]
     async fn apply_model_config_waits_for_a_busy_backend() {
         let (url, calls) = start_mock_backend().await;
         let state = Arc::new(AppState::new(
-            vec![url.clone()],
+            vec![(url.clone(), None)],
             30,
             86400,
             60,
@@ -2189,7 +2352,7 @@ mod tests {
     async fn apply_model_config_loads_missing_models() {
         let (url, calls) = start_mock_backend().await;
         let state = Arc::new(AppState::new(
-            vec![url.clone()],
+            vec![(url.clone(), None)],
             30,
             86400,
             60,

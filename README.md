@@ -268,8 +268,9 @@ Everything about your `ollamaMQ` instance lives in one YAML file with three sect
 ```yaml
 # --- Backends: every Ollama / LM Studio / OpenAI-compatible server you want to use
 backends:
-  - http://10.137.1.1:11434      # e.g. Ollama
-  - http://10.137.1.2:1234       # e.g. LM Studio
+  - http://10.137.1.1:11434      # plain URL — no auth
+  - url: http://10.137.1.2:1234   # object form adds an optional API token,
+    token: "some-api-key"         # sent as `Authorization: Bearer <token>`
 
 # --- Runtime settings (all optional — defaults shown)
 settings:
@@ -309,6 +310,7 @@ models:
 **How it's applied:**
 
 - `backends` and `settings` are read at **startup only** — restart to change them.
+- A backend's optional `token` is sent as `Authorization: Bearer <token>` on every request the proxy makes to that backend — proxied inference, model listings/metadata reads, health probes and model load/unload. It's meant for backends behind an authenticated reverse proxy (LM Studio, vLLM, …). A client's own `Authorization`/`X-Api-Key` header is always forwarded untouched: the token only fills in when the request carries no credentials of its own.
 - `models` is applied automatically at startup (once backend probes have run) and re-applied any time you press **`r`** in the TUI. Application is additive: each target endpoint is checked live first (Ollama `/api/ps`, LM Studio loaded instances), so models already resident there — e.g. still loaded from an earlier run because of long `keep_alive` — are skipped instead of being loaded twice; everything else gets a load started. It never unloads anything, and loads for the same backend run one at a time (backends reject parallel control ops). Every attempt, including skips, is reported in the TUI Logs panel (`⟳ CTL`) and in the log output.
 - A backend won't accept a load while it is serving requests, so each entry **waits for that backend to go idle** (up to 5 minutes) before loading. Without this, restarting the proxy under live traffic meant every configured model was refused on the spot and never retried — leaving models unloaded, or loaded with the wrong `max_ctx`.
 - Explicit CLI flags override file values when given (e.g. `--backend-urls` over `backends`, `--port`/`--host`/`--timeout` over `settings`).
