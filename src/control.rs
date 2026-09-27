@@ -2089,6 +2089,7 @@ mod tests {
             crate::reqlog::RequestLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
+            std::time::Duration::from_millis(100),
         ));
         // Simulate a probed backend: model available AND resident.
         {
@@ -2139,6 +2140,7 @@ mod tests {
             crate::reqlog::RequestLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
+            std::time::Duration::from_millis(100),
         ));
         // Simulate a probed backend: model resident with context 2048 (the
         // mock's /api/ps reports context_length), config wants 16384.
@@ -2208,6 +2210,7 @@ mod tests {
             crate::reqlog::RequestLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
+            std::time::Duration::from_millis(100),
         );
         let cfg = |backends: Vec<String>| crate::config::ModelConfig {
             name: "llama3".into(),
@@ -2298,6 +2301,7 @@ mod tests {
             crate::reqlog::RequestLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
+            std::time::Duration::from_millis(100),
         ));
         {
             let mut backends = state.backends.lock_or_recover();
@@ -2362,6 +2366,7 @@ mod tests {
             crate::reqlog::RequestLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
+            std::time::Duration::from_millis(100),
         ));
         // llama3 is available but NOT resident (mock /api/ps lists only qwen2.5:7b).
         {

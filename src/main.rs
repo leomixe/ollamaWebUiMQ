@@ -182,6 +182,12 @@ async fn main() {
         .or(file_cfg.settings.load_keep_alive)
         .unwrap_or(86400);
     let stuck_timeout = file_cfg.settings.stuck_timeout.unwrap_or(60);
+    let failed_request_min_charge = std::time::Duration::from_millis(
+        file_cfg
+            .settings
+            .failed_request_min_charge_ms
+            .unwrap_or(100),
+    );
     // Default the global per-backend cap to the highest configured per-model
     // concurrency so `max_concurrent_requests: N` isn't silently capped at 1
     // when `settings.max_concurrent_per_backend` is omitted.
@@ -292,6 +298,7 @@ async fn main() {
         reqlog,
         log_content_limit,
         max_queued_bytes,
+        failed_request_min_charge,
     ));
 
     let worker_state = state.clone();

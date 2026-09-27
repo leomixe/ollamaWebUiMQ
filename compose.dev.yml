@@ -1,0 +1,30 @@
+services:
+  ollamawebuimq-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+
+    working_dir: /workspace
+
+    volumes:
+      - .:/workspace
+      - ollamawebuimq-cargo:/root/.cargo
+      - ollamawebuimq-rustup:/root/.rustup
+      - ollamawebuimq-codex:/root/.codex
+
+    networks:
+      - llmnet
+
+    stdin_open: true
+    tty: true
+
+networks:
+  llmnet:
+    external: true
+    name: llmnet
+
+volumes:
+  ollamawebuimq-cargo:
+  ollamawebuimq-rustup:
+  ollamawebuimq-codex:
+

@@ -56,6 +56,10 @@ pub struct Settings {
     /// it before answering 503 (default 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stuck_timeout: Option<u64>,
+    /// Minimum fair-share charge, in milliseconds, for a dispatched request
+    /// that fails or is abandoned before it completes (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_request_min_charge_ms: Option<u64>,
     /// Max simultaneous in-flight requests per backend (default 1 — the
     /// historical one-request-per-backend behavior). Per-model sub-limits come
     /// from each model entry's `max_concurrent_requests`.
@@ -183,8 +187,7 @@ fn is_one(v: &u32) -> bool {
 /// user-facing display (missing file, invalid YAML, etc.). Validates that
 /// keep-alive values are `-1` (keep loaded indefinitely) or non-negative.
 pub fn load_config(path: &str) -> Result<AppConfig, String> {
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    let content = fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
     let cfg: AppConfig =
         serde_yaml::from_str(&content).map_err(|e| format!("invalid YAML in '{}': {}", path, e))?;
 
@@ -227,6 +230,7 @@ settings:
   timeout: 120
   load_keep_alive: 3600
   allow_all_routes: true
+  failed_request_min_charge_ms: 250
 
 models:
   - name: "gpt-oss:120b"
@@ -246,6 +250,7 @@ models:
         assert_eq!(cfg.settings.timeout, Some(120));
         assert_eq!(cfg.settings.load_keep_alive, Some(3600));
         assert_eq!(cfg.settings.allow_all_routes, Some(true));
+        assert_eq!(cfg.settings.failed_request_min_charge_ms, Some(250));
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.models[0].name, "gpt-oss:120b");
         assert_eq!(cfg.models[0].identifier.as_deref(), Some("my-gpt"));
@@ -333,10 +338,12 @@ models:
         let yaml = "models:\n  - name: llama3\n    keep_alive: -5\n";
         let tmp = std::env::temp_dir().join("ollamamq_test_ka_bad.yaml");
         std::fs::write(&tmp, yaml).unwrap();
-        assert!(load_config(tmp.to_str().unwrap())
-            .err()
-            .unwrap()
-            .contains("-5"));
+        assert!(
+            load_config(tmp.to_str().unwrap())
+                .err()
+                .unwrap()
+                .contains("-5")
+        );
     }
 
     #[test]

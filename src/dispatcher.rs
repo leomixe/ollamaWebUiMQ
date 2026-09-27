@@ -1,10 +1,10 @@
+use crate::lock::LockExt;
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, State},
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
 };
-use crate::lock::LockExt;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -252,7 +252,9 @@ fn attach_backend_token(headers: &mut HeaderMap, token: Option<&str>) {
         Some(t)
             if !headers.contains_key(axum::http::header::AUTHORIZATION)
                 && !headers.contains_key("x-api-key") =>
-            t,
+        {
+            t
+        }
         _ => return,
     };
     if let Ok(v) = format!("Bearer {}", t).parse() {
@@ -363,6 +365,9 @@ pub struct AppState {
     /// proxy answers 503 instead of letting the client hang. Requests that
     /// are merely waiting for a busy or loading backend are exempt.
     pub stuck_timeout: std::time::Duration,
+    /// Minimum fair-share charge for dispatched requests that fail or are
+    /// abandoned before a complete response is delivered.
+    pub failed_request_min_charge: std::time::Duration,
     /// Shared HTTP client for proxying and backend control probes.
     pub client: reqwest::Client,
     /// In-flight model control operations, keyed by backend index
@@ -423,7 +428,7 @@ pub struct LogEvent {
 /// as much when deciding whose turn it is.
 const FAIR_SHARE_HALF_LIFE: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Recent scheduling load for one user, as an exponentially decaying score.
+/// Recent backend occupation for one user, as an exponentially decaying score.
 ///
 /// Ordering used to be by `processed_counts`, which is cumulative since
 /// startup and only counts fully delivered responses. Two things went wrong
@@ -431,8 +436,9 @@ const FAIR_SHARE_HALF_LIFE: std::time::Duration = std::time::Duration::from_secs
 /// incremented it and so kept permanent priority over everyone else, and on a
 /// long-lived proxy a newcomer started thousands of requests "behind" an
 /// incumbent and monopolized every backend until it caught up. This score is
-/// charged when a request is DISPATCHED — whatever the outcome — and halves
-/// every [`FAIR_SHARE_HALF_LIFE`], so the order reflects recent load only.
+/// charged after a request releases its backend slot — whatever the outcome —
+/// and halves every [`FAIR_SHARE_HALF_LIFE`], so the order reflects recent
+/// backend occupation only.
 #[derive(Clone, Copy, Debug)]
 pub struct FairShare {
     score: f64,
@@ -442,7 +448,10 @@ pub struct FairShare {
 
 impl FairShare {
     fn new(now: std::time::Instant) -> Self {
-        Self { score: 0.0, updated: now }
+        Self {
+            score: 0.0,
+            updated: now,
+        }
     }
 
     /// The score as of `now`, after decay. Cheap and side-effect free.
@@ -458,10 +467,10 @@ impl FairShare {
         self.updated = now;
     }
 
-    /// Roll forward and charge one dispatched request.
-    fn charge(&mut self, now: std::time::Instant) {
+    /// Roll forward and charge backend occupation time.
+    fn charge(&mut self, now: std::time::Instant, elapsed: std::time::Duration) {
         self.touch(now);
-        self.score += 1.0;
+        self.score += elapsed.as_secs_f64();
     }
 
     /// When this user was last seen (request arrived or was dispatched).
@@ -506,6 +515,7 @@ impl AppState {
         reqlog: crate::reqlog::RequestLogger,
         log_content_limit: usize,
         max_queued_bytes: u64,
+        failed_request_min_charge: std::time::Duration,
     ) -> Self {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
         let backends = backends
@@ -554,6 +564,7 @@ impl AppState {
             last_backend_idx: std::sync::atomic::AtomicUsize::new(0),
             timeout,
             stuck_timeout: std::time::Duration::from_secs(stuck_timeout_secs),
+            failed_request_min_charge,
             client,
             control_ops: Mutex::new(HashMap::new()),
             control_history: Mutex::new(VecDeque::new()),
@@ -679,10 +690,7 @@ fn normalize_model_id(id: &str) -> String {
 /// If a model config entry pins `requested` (by normalized name or identifier)
 /// to a non-empty backend list, return that list. First matching entry wins
 /// (config file order). Returns None when the model is not pinned.
-fn model_pin_for(
-    requested: &str,
-    configs: &[crate::config::ModelConfig],
-) -> Option<Vec<String>> {
+fn model_pin_for(requested: &str, configs: &[crate::config::ModelConfig]) -> Option<Vec<String>> {
     let requested_norm = normalize_model_id(requested);
     configs
         .iter()
@@ -856,12 +864,7 @@ fn is_endpoint_rejection(status: StatusCode, body_prefix: &str) -> bool {
 /// Record a traffic observation for one backend + API family. Two consecutive
 /// endpoint rejections mark the family as rejected (the scheduler then excludes
 /// this backend for that family); any non-rejection response clears the memory.
-fn apply_family_learning(
-    state: &AppState,
-    backend_idx: usize,
-    family: ApiFamily,
-    rejected: bool,
-) {
+fn apply_family_learning(state: &AppState, backend_idx: usize, family: ApiFamily, rejected: bool) {
     if family == ApiFamily::Unknown {
         return; // nothing to learn from unrecognized paths
     }
@@ -881,8 +884,7 @@ fn apply_family_learning(
                 count
             );
         }
-    } else if b.family_fail_counts.remove(&family).is_some()
-        || b.rejected_families.remove(&family)
+    } else if b.family_fail_counts.remove(&family).is_some() || b.rejected_families.remove(&family)
     {
         debug!(
             "Backend {} serves {}-family requests again; cleared rejection memory",
@@ -941,9 +943,7 @@ fn prune_idle_users(state: &AppState, retention: std::time::Duration) {
     let mut remove: Vec<String> = idle
         .iter()
         .enumerate()
-        .filter(|(i, (_, seen))| {
-            *i < over_cap || now.saturating_duration_since(*seen) > retention
-        })
+        .filter(|(i, (_, seen))| *i < over_cap || now.saturating_duration_since(*seen) > retention)
         .map(|(_, (user, _))| user.clone())
         .collect();
     if remove.is_empty() {
@@ -981,6 +981,16 @@ fn prune_idle_users(state: &AppState, retention: std::time::Duration) {
 /// One backend to probe in a health round: (index, url, token,
 /// was_online, known-bad endpoints to skip).
 type ProbeTarget = (usize, String, Option<String>, bool, HashSet<String>);
+
+struct SelectedTask {
+    user_id: String,
+    task: Task,
+    backend_idx: usize,
+    backend_url: String,
+    backend_token: Option<String>,
+    metadata: bool,
+    occupied_started: Option<std::time::Instant>,
+}
 
 async fn health_check_round(
     state: &Arc<AppState>,
@@ -1069,7 +1079,11 @@ async fn health_check_round(
             info!("Backend {} status changed to: OFFLINE", url);
         }
         if b.api_type != was_api_type {
-            info!("Backend {} API type detected: {}", url, b.api_type.display());
+            info!(
+                "Backend {} API type detected: {}",
+                url,
+                b.api_type.display()
+            );
         }
         for e in &newly_bad {
             info!(
@@ -1132,8 +1146,12 @@ pub async fn run_worker(state: Arc<AppState>) {
             let mut queues = state.queues.lock_or_recover();
             // Backends with a model control op (load/unload) in flight are treated as
             // busy: loading a new model can evict whatever is currently running.
-            let control_busy: HashSet<usize> =
-                state.control_ops.lock_or_recover().keys().copied().collect();
+            let control_busy: HashSet<usize> = state
+                .control_ops
+                .lock_or_recover()
+                .keys()
+                .copied()
+                .collect();
             // Model pins for every queued task, computed BEFORE taking the
             // backends lock (the model_config lock must not nest under it —
             // config reloads run concurrently). A pin restricts a model's
@@ -1141,12 +1159,14 @@ pub async fn run_worker(state: Arc<AppState>) {
             let task_pins: HashMap<(String, usize), Vec<String>> = queues
                 .iter()
                 .flat_map(|(user, q)| {
-                    q.iter().enumerate().filter_map(|(pos, t)| match &t.requested_model {
-                        Some(model) => {
-                            model_pin_for(model, &configs).map(|pin| ((user.clone(), pos), pin))
-                        }
-                        None => None,
-                    })
+                    q.iter()
+                        .enumerate()
+                        .filter_map(|(pos, t)| match &t.requested_model {
+                            Some(model) => {
+                                model_pin_for(model, &configs).map(|pin| ((user.clone(), pos), pin))
+                            }
+                            None => None,
+                        })
                 })
                 .collect();
             let mut backends = state.backends.lock_or_recover();
@@ -1222,14 +1242,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // the FIRST routable task (not just the front) so an
                 // unroutable request — e.g. an Ollama-family call with every
                 // Ollama backend offline — can't starve everything behind it.
-                let mut selection: Option<(
-                    String,
-                    Task,
-                    usize,
-                    String,
-                    Option<String>,
-                    bool,
-                )> = None;
+                let mut selection: Option<SelectedTask> = None;
                 'users: for &ui in &order {
                     let user_id = &active_users[ui];
                     let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
@@ -1257,8 +1270,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // cap + per-model limit), and support the required API + Model.
                         // `limits` is taken once per selection round, above —
                         // it used to be locked and dropped for every task examined.
-                        let model_key =
-                            task_ref.requested_model.as_deref().map(model_concurrency_key);
+                        let model_key = task_ref
+                            .requested_model
+                            .as_deref()
+                            .map(model_concurrency_key);
                         let model_limit = match &model_key {
                             Some(k) => limits.get(k).copied().unwrap_or(1),
                             None => 0, // unused for model-less requests
@@ -1398,22 +1413,15 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         Some(model) => {
                                             model_routable(model, &b.available_models)
                                                 && pin.as_ref().is_none_or(|pins| {
-                                                    pins.iter()
-                                                        .any(|p| pin_url_matches(p, &b.url))
+                                                    pins.iter().any(|p| pin_url_matches(p, &b.url))
                                                 })
                                         }
                                         None => true,
                                     }
                             });
 
-                            if !satisfiable
-                                && task_ref.queued_at.elapsed() >= state.stuck_timeout
-                            {
-                                let dropped = queues
-                                    .get_mut(user_id)
-                                    .unwrap()
-                                    .remove(pos)
-                                    .unwrap();
+                            if !satisfiable && task_ref.queued_at.elapsed() >= state.stuck_timeout {
+                                let dropped = queues.get_mut(user_id).unwrap().remove(pos).unwrap();
                                 release_queued_bytes(&state, dropped.body.len() as u64);
                                 state
                                     .global_counter
@@ -1524,19 +1532,6 @@ pub async fn run_worker(state: Arc<AppState>) {
                         state
                             .global_counter
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Charge the user for the work now, not on success:
-                        // a request that fails or is abandoned still consumed
-                        // a backend, and must not buy priority for the next.
-                        {
-                            let now = std::time::Instant::now();
-                            state
-                                .fair_share
-                                .lock_or_recover()
-                                .entry(user_id.clone())
-                                .or_insert_with(|| FairShare::new(now))
-                                .charge(now);
-                        }
-
                         // Round-Robin among eligible backends with min connections
                         let min_conns = eligible_indices
                             .iter()
@@ -1570,15 +1565,17 @@ pub async fn run_worker(state: Arc<AppState>) {
                             backends[selected_backend_idx].current_model =
                                 task.requested_model.clone();
                         }
+                        let occupied_started = (!metadata).then(std::time::Instant::now);
 
-                        selection = Some((
-                            user_id.clone(),
+                        selection = Some(SelectedTask {
+                            user_id: user_id.clone(),
                             task,
-                            selected_backend_idx,
-                            backends[selected_backend_idx].url.clone(),
-                            backends[selected_backend_idx].token.clone(),
+                            backend_idx: selected_backend_idx,
+                            backend_url: backends[selected_backend_idx].url.clone(),
+                            backend_token: backends[selected_backend_idx].token.clone(),
                             metadata,
-                        ));
+                            occupied_started,
+                        });
                         break 'users;
                     }
                 }
@@ -1588,7 +1585,15 @@ pub async fn run_worker(state: Arc<AppState>) {
         };
 
         match selection_opt {
-            Some((user_id, task, backend_idx, backend_url, backend_token, metadata)) => {
+            Some(SelectedTask {
+                user_id,
+                task,
+                backend_idx,
+                backend_url,
+                backend_token,
+                metadata,
+                occupied_started,
+            }) => {
                 let state_clone = state.clone();
                 let client_clone = client.clone();
                 let url = format!("{}{}", backend_url, task.path);
@@ -1596,19 +1601,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                 tokio::spawn(async move {
                     let log_model = task.requested_model.clone();
                     let api_family = detect_api_family(&task.path);
-                    let log_out = |info: String,
-                                   backend: Option<String>,
-                                   content: Option<Arc<String>>| {
-                        state_clone.log_event(LogEvent {
-                            at: std::time::SystemTime::now(),
-                            dir: "OUT",
-                            user: user_id.clone(),
-                            model: log_model.clone(),
-                            backend,
-                            info,
-                            content,
-                        });
-                    };
+                    let log_out =
+                        |info: String, backend: Option<String>, content: Option<Arc<String>>| {
+                            state_clone.log_event(LogEvent {
+                                at: std::time::SystemTime::now(),
+                                dir: "OUT",
+                                user: user_id.clone(),
+                                model: log_model.clone(),
+                                backend,
+                                info,
+                                content,
+                            });
+                        };
 
                     // Set only when a response was delivered to the client in
                     // full; `processed_count` used to be bumped on every exit
@@ -1630,11 +1634,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     if is_blocked || task.responder.is_closed() {
                         let mut dropped = state_clone.dropped_counts.lock_or_recover();
                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
-                        log_out(
-                            "dropped (blocked)".into(),
-                            Some(backend_url.clone()),
-                            None,
-                        );
+                        log_out("dropped (blocked)".into(), Some(backend_url.clone()), None);
                     } else {
                         {
                             let mut processing = state_clone.processing_counts.lock_or_recover();
@@ -1697,13 +1697,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 }
                                                 let n = chunk.len();
                                                 total_bytes += n as u64;
-                                                if content_acc.len() < state_clone.log_content_limit {
-                                                    let room =
-                                                        state_clone.log_content_limit
-                                                            - content_acc.len();
-                                                    content_acc.extend_from_slice(
-                                                        &chunk[..n.min(room)],
-                                                    );
+                                                if content_acc.len() < state_clone.log_content_limit
+                                                {
+                                                    let room = state_clone.log_content_limit
+                                                        - content_acc.len();
+                                                    content_acc
+                                                        .extend_from_slice(&chunk[..n.min(room)]);
                                                 }
                                                 if task
                                                     .responder
@@ -1737,12 +1736,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             state_clone.processed_counts.lock_or_recover();
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
                                         drop(counts);
-                                        let content_str = Arc::new(
-                                            crate::reqlog::truncate_utf8(
-                                                &content_acc,
-                                                state_clone.log_content_limit,
-                                            ),
-                                        );
+                                        let content_str = Arc::new(crate::reqlog::truncate_utf8(
+                                            &content_acc,
+                                            state_clone.log_content_limit,
+                                        ));
                                         state_clone.reqlog.log(crate::reqlog::ReqRecord {
                                             ts: crate::reqlog::now_unix_millis(),
                                             dir: "OUT",
@@ -1759,7 +1756,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         log_out(
                                             format!(
                                                 "{} {} -> {} resp={}B",
-                                                method_str, path_str, status.as_u16(), total_bytes
+                                                method_str,
+                                                path_str,
+                                                status.as_u16(),
+                                                total_bytes
                                             ),
                                             Some(backend_url.clone()),
                                             Some(content_str),
@@ -1836,6 +1836,19 @@ pub async fn run_worker(state: Arc<AppState>) {
                             b.processed_count += 1;
                         }
                     }
+                    if let Some(started) = occupied_started {
+                        let now = std::time::Instant::now();
+                        let mut elapsed = now.saturating_duration_since(started);
+                        if !delivered {
+                            elapsed = elapsed.max(state_clone.failed_request_min_charge);
+                        }
+                        state_clone
+                            .fair_share
+                            .lock_or_recover()
+                            .entry(user_id.clone())
+                            .or_insert_with(|| FairShare::new(now))
+                            .charge(now, elapsed);
+                    }
                     state_clone.backend_freed.notify_one();
                 });
             }
@@ -1862,11 +1875,7 @@ pub async fn proxy_handler(
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
     let ip = addr.ip();
-    let user_id = headers
-        .get("X-User-ID")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_string();
+    let user_id = request_user_id(&headers);
 
     if state.is_ip_blocked(&ip) {
         warn!("Blocked request from IP: {} for user: {}", ip, user_id);
@@ -2087,6 +2096,15 @@ pub async fn proxy_handler(
     }
 }
 
+fn request_user_id(headers: &HeaderMap) -> String {
+    headers
+        .get("X-OpenWebUI-User-Id")
+        .or_else(|| headers.get("X-User-ID"))
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("anonymous")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2144,7 +2162,10 @@ mod tests {
         );
         assert_eq!(parse(&big).as_deref(), Some("qwen3"));
         // Field order must not matter either.
-        assert_eq!(parse(r#"{"model":"a","options":{"num_ctx":8}}"#).as_deref(), Some("a"));
+        assert_eq!(
+            parse(r#"{"model":"a","options":{"num_ctx":8}}"#).as_deref(),
+            Some("a")
+        );
 
         // Leading whitespace is fine.
         assert_eq!(parse("  \n\t{\"model\":\"b\"}").as_deref(), Some("b"));
@@ -2173,7 +2194,10 @@ mod tests {
     #[test]
     fn normalized_matching_strips_owner_and_quant() {
         // Client asks "qwen3.8-27b"; server lists publisher/quant variants of it.
-        assert!(model_routable("qwen3.8-27b", &set(&["unsloth/qwen3.8-27b@q8_0"])));
+        assert!(model_routable(
+            "qwen3.8-27b",
+            &set(&["unsloth/qwen3.8-27b@q8_0"])
+        ));
         assert!(model_routable("qwen3.8-27b", &set(&["qwen/qwen3.8-27b"])));
         // Quant suffixes on either side are normalized away (same model family).
         assert!(model_routable(
@@ -2212,8 +2236,14 @@ mod tests {
     fn bare_names_match_across_publishers() {
         // "llama3" reaches meta-llama/llama3:latest (publisher stripped), but a
         // different base name does not match on prefix alone.
-        assert!(model_routable("llama3", &set(&["meta-llama/llama3:latest"])));
-        assert!(!model_routable("llama3", &set(&["meta-llama/llama3.1:latest"])));
+        assert!(model_routable(
+            "llama3",
+            &set(&["meta-llama/llama3:latest"])
+        ));
+        assert!(!model_routable(
+            "llama3",
+            &set(&["meta-llama/llama3.1:latest"])
+        ));
     }
 
     fn backend_with(api_type: BackendApiType, rejected: &[ApiFamily]) -> BackendStatus {
@@ -2317,7 +2347,10 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             "boom"
         ));
-        assert!(!is_endpoint_rejection(StatusCode::OK, r#"{"message":"ok"}"#));
+        assert!(!is_endpoint_rejection(
+            StatusCode::OK,
+            r#"{"message":"ok"}"#
+        ));
 
         // A body prefix truncated mid-JSON is NOT evidence either way: real
         // rejections are short and parse whole. This is the first 512 bytes of
@@ -2328,7 +2361,10 @@ mod tests {
         let complete = r#"{"model":"llama3","response":"use the POST method on that endpoint"}"#;
         assert!(!is_endpoint_rejection(StatusCode::OK, complete));
         // A non-string error field is not a message to match on.
-        assert!(!is_endpoint_rejection(StatusCode::OK, r#"{"error":{"code":42}}"#));
+        assert!(!is_endpoint_rejection(
+            StatusCode::OK,
+            r#"{"error":{"code":42}}"#
+        ));
     }
 
     #[test]
@@ -2455,22 +2491,26 @@ mod tests {
             crate::reqlog::RequestLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
+            std::time::Duration::from_millis(100),
         ));
 
         let (tx, mut rx) = mpsc::channel(32);
         {
             let mut queues = state.queues.lock_or_recover();
-            queues.entry("tester".to_string()).or_default().push_back(Task {
-                method: Method::POST,
-                user: "127.0.0.1:41000".to_string(),
-                path: "/api/chat".into(),
-                headers: HeaderMap::new(),
-                body: Bytes::from(r#"{"model":"no-such-model-xyz","messages":[]}"#),
-                responder: tx,
-                requested_model: Some("no-such-model-xyz".to_string()),
-                stuck_warned: false,
-                queued_at: std::time::Instant::now(),
-            });
+            queues
+                .entry("tester".to_string())
+                .or_default()
+                .push_back(Task {
+                    method: Method::POST,
+                    user: "127.0.0.1:41000".to_string(),
+                    path: "/api/chat".into(),
+                    headers: HeaderMap::new(),
+                    body: Bytes::from(r#"{"model":"no-such-model-xyz","messages":[]}"#),
+                    responder: tx,
+                    requested_model: Some("no-such-model-xyz".to_string()),
+                    stuck_warned: false,
+                    queued_at: std::time::Instant::now(),
+                });
         }
 
         // Enqueued before the worker starts: its first scan pass sees it.
@@ -2494,19 +2534,14 @@ mod tests {
     /// request and answers 200. `/api/tags` returns an Ollama-style listing
     /// so the health probes keep `llama3` available on it.
     #[allow(clippy::type_complexity)]
-    async fn spawn_recording_backend() -> (
-        String,
-        Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
-    ) {
+    async fn spawn_recording_backend()
+    -> (String, Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>) {
         let calls: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind recording backend");
-        let url = format!(
-            "http://{}",
-            listener.local_addr().expect("mock local addr")
-        );
+        let url = format!("http://{}", listener.local_addr().expect("mock local addr"));
         let c = calls.clone();
         tokio::spawn(async move {
             let app = axum::Router::new().route(
@@ -2574,6 +2609,323 @@ mod tests {
         backends[0].available_models = Arc::new(set(&["llama3"]));
     }
 
+    fn fair_score(state: &Arc<AppState>, user: &str) -> f64 {
+        let now = std::time::Instant::now();
+        state
+            .fair_share
+            .lock_or_recover()
+            .get(user)
+            .map(|s| s.value_at(now))
+            .unwrap_or(0.0)
+    }
+
+    async fn wait_for_fair_score(state: &Arc<AppState>, user: &str) -> f64 {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let score = fair_score(state, user);
+                if score > 0.0 {
+                    return score;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fair-share score was never charged")
+    }
+
+    fn enqueue_via_proxy(
+        state: Arc<AppState>,
+        user_header: &'static str,
+        user: &str,
+    ) -> tokio::task::JoinHandle<axum::response::Response> {
+        let mut headers = HeaderMap::new();
+        headers.insert(user_header, user.parse().expect("header value"));
+        tokio::spawn(async move {
+            proxy_handler(
+                State(state),
+                ConnectInfo("127.0.0.1:41003".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                Bytes::from_static(br#"{"model":"llama3","messages":[]}"#),
+            )
+            .await
+            .into_response()
+        })
+    }
+
+    async fn spawn_streaming_backend(
+        delay: std::time::Duration,
+    ) -> (String, tokio::task::AbortHandle) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming backend");
+        let url = format!("http://{}", listener.local_addr().expect("mock local addr"));
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let n = match sock.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("");
+                    if path == "/api/tags" {
+                        let body = r#"{"models":[{"name":"llama3"}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(response.as_bytes()).await;
+                        return;
+                    }
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(b"5\r\nfirst\r\n").await;
+                    tokio::time::sleep(delay).await;
+                    let _ = sock.write_all(b"6\r\nsecond\r\n0\r\n\r\n").await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (url, handle.abort_handle())
+    }
+
+    async fn spawn_failing_backend() -> (String, tokio::task::AbortHandle) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing backend");
+        let url = format!("http://{}", listener.local_addr().expect("mock local addr"));
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let n = match sock.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("");
+                    if path == "/api/tags" {
+                        let body = r#"{"models":[{"name":"llama3"}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        (url, handle.abort_handle())
+    }
+
+    #[tokio::test]
+    async fn openwebui_user_id_header_takes_precedence() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-OpenWebUI-User-Id", "openwebui".parse().unwrap());
+        headers.insert("X-User-ID", "legacy".parse().unwrap());
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            proxy_handler(
+                State(state.clone()),
+                ConnectInfo("127.0.0.1:41004".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                Bytes::from_static(br#"{"model":"llama3","messages":[]}"#),
+            ),
+        )
+        .await;
+
+        assert!(response.is_err(), "request should remain queued");
+        let queues = state.queues.lock_or_recover();
+        assert!(queues.contains_key("openwebui"));
+        assert!(!queues.contains_key("legacy"));
+    }
+
+    #[tokio::test]
+    async fn legacy_user_id_header_is_fallback() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-User-ID", "legacy".parse().unwrap());
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            proxy_handler(
+                State(state.clone()),
+                ConnectInfo("127.0.0.1:41005".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                Bytes::from_static(br#"{"model":"llama3","messages":[]}"#),
+            ),
+        )
+        .await;
+
+        assert!(response.is_err(), "request should remain queued");
+        let queues = state.queues.lock_or_recover();
+        assert!(queues.contains_key("legacy"));
+    }
+
+    #[tokio::test]
+    async fn fair_share_charges_backend_occupation_time() {
+        let (url, mock) = spawn_streaming_backend(std::time::Duration::from_millis(200)).await;
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, None);
+
+        let worker = tokio::spawn(run_worker(state.clone()));
+        let handle = enqueue_via_proxy(state.clone(), "X-User-ID", "timed");
+        let response = handle.await.expect("proxy task joined");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response");
+
+        let score = wait_for_fair_score(&state, "timed").await;
+        assert!(
+            score >= 0.15,
+            "score should reflect backend wall time, got {score}"
+        );
+
+        worker.abort();
+        mock.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_request_is_charged_after_stream_completion() {
+        let (url, mock) = spawn_streaming_backend(std::time::Duration::from_millis(250)).await;
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, None);
+
+        let worker = tokio::spawn(run_worker(state.clone()));
+        let response = enqueue_via_proxy(state.clone(), "X-User-ID", "streamer")
+            .await
+            .expect("proxy task joined");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream
+            .next()
+            .await
+            .expect("first body item")
+            .expect("first chunk");
+        assert_eq!(first, Bytes::from_static(b"first"));
+        assert_eq!(
+            fair_score(&state, "streamer"),
+            0.0,
+            "stream must not be charged before completion"
+        );
+
+        let mut rest = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            rest.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+        let rest = Bytes::from(rest);
+        assert_eq!(rest, Bytes::from_static(b"second"));
+        let score = wait_for_fair_score(&state, "streamer").await;
+        assert!(
+            score >= 0.20,
+            "score should include the delayed stream tail, got {score}"
+        );
+
+        worker.abort();
+        mock.abort();
+    }
+
+    #[tokio::test]
+    async fn disconnected_request_is_charged_for_consumed_time() {
+        let (url, mock) = spawn_streaming_backend(std::time::Duration::from_millis(200)).await;
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, None);
+
+        let (tx, rx) = mpsc::channel(32);
+        let body = Bytes::from(r#"{"model":"llama3","messages":[]}"#);
+        state
+            .queues
+            .lock_or_recover()
+            .entry("gone".to_string())
+            .or_default()
+            .push_back(Task {
+                method: Method::POST,
+                user: "127.0.0.1:41006".to_string(),
+                path: "/api/chat".into(),
+                headers: HeaderMap::new(),
+                body,
+                responder: tx,
+                requested_model: Some("llama3".to_string()),
+                stuck_warned: false,
+                queued_at: std::time::Instant::now(),
+            });
+
+        let worker = tokio::spawn(run_worker(state.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.backends.lock_or_recover()[0].active_requests == 1 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("request was never dispatched");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(rx);
+        let score = wait_for_fair_score(&state, "gone").await;
+        assert!(
+            score >= 0.15,
+            "disconnect should still charge backend wait, got {score}"
+        );
+
+        worker.abort();
+        mock.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_request_gets_minimum_charge() {
+        let (url, mock) = spawn_failing_backend().await;
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, None);
+        let _rx = enqueue_llama_chat(&state, HeaderMap::new());
+
+        let worker = tokio::spawn(run_worker(state.clone()));
+        let score = wait_for_fair_score(&state, "tester").await;
+        assert!(
+            score >= 0.09,
+            "backend error should receive minimum charge, got {score}"
+        );
+
+        worker.abort();
+        mock.abort();
+    }
+
     /// The configured backend token is attached to proxied requests that carry
     /// no client credentials of their own.
     #[tokio::test]
@@ -2593,7 +2945,10 @@ mod tests {
         worker.abort();
 
         let calls = calls.lock_or_recover().clone();
-        let chat: Vec<_> = calls.into_iter().filter(|(p, _)| p == "/api/chat").collect();
+        let chat: Vec<_> = calls
+            .into_iter()
+            .filter(|(p, _)| p == "/api/chat")
+            .collect();
         assert_eq!(chat.len(), 1);
         assert_eq!(chat[0].1.as_deref(), Some("Bearer sekrit"));
     }
@@ -2622,7 +2977,10 @@ mod tests {
         worker.abort();
 
         let calls = calls.lock_or_recover().clone();
-        let chat: Vec<_> = calls.into_iter().filter(|(p, _)| p == "/api/chat").collect();
+        let chat: Vec<_> = calls
+            .into_iter()
+            .filter(|(p, _)| p == "/api/chat")
+            .collect();
         assert_eq!(chat.len(), 1);
         assert_eq!(chat[0].1.as_deref(), Some("Bearer client-key"));
     }
@@ -2654,10 +3012,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock backend");
-        let url = format!(
-            "http://{}",
-            listener.local_addr().expect("mock local addr")
-        );
+        let url = format!("http://{}", listener.local_addr().expect("mock local addr"));
         let v1 = v1_models.to_string();
         let native = native_models.map(|s| s.to_string());
         let handle = tokio::spawn(async move {
@@ -2711,8 +3066,7 @@ mod tests {
     /// LM Studio backend scenario shared by the tier tests: ovisocr2 loaded,
     /// qwen listed but not loaded (probe answers that reproduce exactly this
     /// state, loaded_state_known = true).
-    const OVISOCR2_V1_MODELS: &str =
-        r#"{"data":[{"id":"qwen3.8-27b"},{"id":"ovisocr2@q4_k_m"}]}"#;
+    const OVISOCR2_V1_MODELS: &str = r#"{"data":[{"id":"qwen3.8-27b"},{"id":"ovisocr2@q4_k_m"}]}"#;
     const OVISOCR2_NATIVE: &str = r#"{"models":[{"key":"ovisocr2@q4_k_m","display_name":"OvisOCR2","loaded_instances":[{"id":"ovisocr2@q4_k_m"}]}]}"#;
     /// OpenAI-style list for the second backend in each scenario.
     const QWEN_V1_MODELS: &str = r#"{"data":[{"id":"qwen3.8-27b"}]}"#;
@@ -2763,6 +3117,7 @@ mod tests {
             crate::reqlog::RequestLogger::disabled(),
             65_536,
             max_queued_bytes,
+            std::time::Duration::from_millis(100),
         ))
     }
 
@@ -3077,20 +3432,20 @@ mod tests {
     }
 
     #[test]
-    fn fair_share_decays_and_charges_every_dispatch() {
+    fn fair_share_decays_and_charges_backend_time() {
         let now = std::time::Instant::now();
         let mut u = FairShare::new(now);
         assert_eq!(u.value_at(now), 0.0);
 
-        u.charge(now);
-        assert!((u.value_at(now) - 1.0).abs() < 1e-9);
+        u.charge(now, std::time::Duration::from_secs_f64(2.5));
+        assert!((u.value_at(now) - 2.5).abs() < 1e-9);
         // One half-life on, that unit of load counts half.
         let half = now + FAIR_SHARE_HALF_LIFE;
-        assert!((u.value_at(half) - 0.5).abs() < 1e-9);
+        assert!((u.value_at(half) - 1.25).abs() < 1e-9);
 
         // `touch` marks the user as seen without adding load.
         let mut v = FairShare::new(now);
-        v.charge(now);
+        v.charge(now, std::time::Duration::from_secs(1));
         v.touch(half);
         assert!((v.value_at(half) - 0.5).abs() < 1e-9);
         assert_eq!(v.last_seen(), half);
@@ -3103,15 +3458,15 @@ mod tests {
         let now = std::time::Instant::now();
         let mut heavy = FairShare::new(now);
         for _ in 0..10 {
-            heavy.charge(now);
+            heavy.charge(now, std::time::Duration::from_secs(1));
         }
         let mut light = FairShare::new(now);
-        light.charge(now);
+        light.charge(now, std::time::Duration::from_secs(1));
 
         // Twenty minutes (four half-lives) later the heavy user has been
         // quiet while the light user keeps working: 10/16 vs 1/16 + 1.
         let later = now + std::time::Duration::from_secs(1200);
-        light.charge(later);
+        light.charge(later, std::time::Duration::from_secs(1));
         assert!(
             heavy.value_at(later) < light.value_at(later),
             "the formerly heavy user must get a turn: {} vs {}",
@@ -3167,7 +3522,11 @@ mod tests {
             MAX_QUEUED_PER_USER
         );
         assert_eq!(
-            state.dropped_counts.lock_or_recover().get("tester").copied(),
+            state
+                .dropped_counts
+                .lock_or_recover()
+                .get("tester")
+                .copied(),
             Some(1)
         );
         drop(keep_alive);
@@ -3209,7 +3568,11 @@ mod tests {
             "a refused request must not consume budget"
         );
         assert_eq!(
-            state.dropped_counts.lock_or_recover().get("tester").copied(),
+            state
+                .dropped_counts
+                .lock_or_recover()
+                .get("tester")
+                .copied(),
             Some(1)
         );
 
@@ -3221,8 +3584,7 @@ mod tests {
             .queued_bytes
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let admitted =
-            tokio::time::timeout(std::time::Duration::from_millis(300), call(&[b'y'; 4_000]))
-                .await;
+            tokio::time::timeout(std::time::Duration::from_millis(300), call(&[b'y'; 4_000])).await;
         assert!(
             admitted.is_err(),
             "an oversized body on an empty queue must be admitted, not refused"
@@ -3247,13 +3609,28 @@ mod tests {
         {
             let mut scores = state.fair_share.lock_or_recover();
             // Seen a while back, nothing queued → prunable.
-            scores.insert("stale".into(), FairShare { score: 0.0, updated: a_while_ago });
+            scores.insert(
+                "stale".into(),
+                FairShare {
+                    score: 0.0,
+                    updated: a_while_ago,
+                },
+            );
             // Seen just now → kept regardless.
             scores.insert("recent".into(), FairShare::new(now));
             // Seen a while back, but still has a request waiting → kept.
-            scores.insert("waiting".into(), FairShare { score: 0.0, updated: a_while_ago });
+            scores.insert(
+                "waiting".into(),
+                FairShare {
+                    score: 0.0,
+                    updated: a_while_ago,
+                },
+            );
         }
-        state.processed_counts.lock_or_recover().insert("stale".into(), 7);
+        state
+            .processed_counts
+            .lock_or_recover()
+            .insert("stale".into(), 7);
         state
             .user_ips
             .lock_or_recover()
@@ -3288,7 +3665,12 @@ mod tests {
             "a user with a queued request must never be dropped"
         );
         // The stale user's other bookkeeping goes with them...
-        assert!(!state.processed_counts.lock_or_recover().contains_key("stale"));
+        assert!(
+            !state
+                .processed_counts
+                .lock_or_recover()
+                .contains_key("stale")
+        );
         assert!(!state.user_ips.lock_or_recover().contains_key("stale"));
         // ...and the waiting user's request is still queued.
         assert_eq!(state.queues.lock_or_recover()["waiting"].len(), 1);
@@ -3340,11 +3722,8 @@ mod tests {
     #[tokio::test]
     async fn model_listing_skips_incompatible_and_offline_backends() {
         let (url_a, mock_a) = spawn_mock_backend(QWEN_V1_MODELS, None).await;
-        let (url_b, mock_b) = spawn_mock_backend(
-            r#"{"object":"list","data":[{"id":"never-listed"}]}"#,
-            None,
-        )
-        .await;
+        let (url_b, mock_b) =
+            spawn_mock_backend(r#"{"object":"list","data":[{"id":"never-listed"}]}"#, None).await;
         let state = new_test_state(vec![url_a, url_b]);
         {
             let mut backends = state.backends.lock_or_recover();
@@ -3375,7 +3754,11 @@ mod tests {
             let mut backends = state.backends.lock_or_recover();
             backends[0].is_online = false;
         }
-        assert!(aggregate_model_list(&state, ApiFamily::OpenAi).await.is_none());
+        assert!(
+            aggregate_model_list(&state, ApiFamily::OpenAi)
+                .await
+                .is_none()
+        );
 
         mock_a.abort();
         mock_b.abort();
@@ -3566,10 +3949,7 @@ mod tests {
     /// Enqueue one `POST /v1/chat/completions` request for `model` under user
     /// "tester" (same shape as enqueue_qwen_request). Returns the receiver —
     /// keep it alive for the test's duration.
-    fn enqueue_chat_request(
-        state: &Arc<AppState>,
-        model: &str,
-    ) -> mpsc::Receiver<ResponsePart> {
+    fn enqueue_chat_request(state: &Arc<AppState>, model: &str) -> mpsc::Receiver<ResponsePart> {
         let (tx, rx) = mpsc::channel(32);
         state
             .queues
@@ -3593,15 +3973,24 @@ mod tests {
 
     /// Append a model entry to the test state's model config (the pin under
     /// test). `backends` empty = the entry does NOT pin.
-    fn pin_model(state: &Arc<AppState>, name: &str, identifier: Option<&str>, backends: Vec<String>) {
-        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
-            name: name.to_string(),
-            identifier: identifier.map(|s| s.to_string()),
-            max_ctx: None,
-            keep_alive: None,
-            max_concurrent_requests: 1,
-            backends,
-        });
+    fn pin_model(
+        state: &Arc<AppState>,
+        name: &str,
+        identifier: Option<&str>,
+        backends: Vec<String>,
+    ) {
+        state
+            .model_config
+            .lock()
+            .unwrap()
+            .push(crate::config::ModelConfig {
+                name: name.to_string(),
+                identifier: identifier.map(|s| s.to_string()),
+                max_ctx: None,
+                keep_alive: None,
+                max_concurrent_requests: 1,
+                backends,
+            });
     }
 
     /// Two-backend test AppState with a per-backend cap high enough that a
@@ -3620,6 +4009,7 @@ mod tests {
             crate::reqlog::RequestLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
+            std::time::Duration::from_millis(100),
         ))
     }
 
@@ -3738,9 +4128,7 @@ mod tests {
         // Substring pin: A's URL without the scheme (B is a different port).
         let pin_url = mock0.0.trim_start_matches("http://").to_string();
         assert!(
-            !pin_url.is_empty()
-                && pin_url != mock0.0
-                && !mock1.0.contains(&pin_url),
+            !pin_url.is_empty() && pin_url != mock0.0 && !mock1.0.contains(&pin_url),
             "pin must be a proper substring of A's URL only: pin={} a={} b={}",
             pin_url,
             mock0.0,

@@ -18,10 +18,10 @@
 - **Fail-Fast for Unsatisfiable Requests**: If no online backend can ever serve a queued request (wrong API family or model absent everywhere), it is answered with `503` after `stuck_timeout` seconds instead of hanging forever. Requests merely waiting for a busy or loading backend are unaffected.
 - **Per-Model Concurrency Limits**: Each model entry's `max_concurrent_requests` caps how many in-flight requests one backend may serve for that model, bounded globally by `settings.max_concurrent_per_backend` (default 1 — the historical one-request-per-backend behavior; raise it to let a single backend handle several requests at once). The limit is keyed on the model's base name, so it applies no matter how the client spells it — `qwen3.8-27b`, `qwen/qwen3.8-27b` and `unsloth/qwen3.8-27b@q8_0` all draw on the same budget as the configured entry.
 - **Metadata Reads Never Queue**: `/`, `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/v1/models` and `/v1/models/{model}` don't run inference, so they neither wait for a free backend slot nor occupy one — a chat UI polling `/api/tags` on a timer is answered immediately instead of queueing behind a multi-minute generation (or a model load) with the default `max_concurrent_per_backend: 1`.
-- **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
+- **Per-User Queuing**: Each user (identified by `X-OpenWebUI-User-Id`, falling back to `X-User-ID`) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
 - **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
-- **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
-- **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
+- **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent backend occupation time**: each dispatched request is charged for the wall-clock time it holds a backend slot, and that score halves every 5 minutes. Failed or disconnected requests are still charged for time consumed, with a small configurable minimum for failures.
+- **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-OpenWebUI-User-Id` and `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Open WebUI** and **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
@@ -86,7 +86,7 @@ docker run -d \
 
 ### API Proxying
 
-Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-ID` header.
+Point your LLM clients to the `ollamaMQ` port (`11435`). Open WebUI users are identified from `X-OpenWebUI-User-Id`; other clients can use `X-User-ID`.
 
 #### Supported Endpoints:
 
@@ -117,7 +117,7 @@ Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-
 
 ```bash
 curl -X POST http://localhost:11435/api/chat \
-  -H "X-User-ID: developer-1" \
+  -H "X-OpenWebUI-User-Id: developer-1" \
   -d '{
     "model": "qwen3.5:35b",
     "messages": [{"role": "user", "content": "Explain quantum computing."}],
@@ -417,7 +417,7 @@ OLLAMA_MQ_API_KEY=supersecret ollamaMQ --no-tui
 # Call the API with the key (either header works)
 curl -X POST http://localhost:11435/api/chat \
   -H "Authorization: Bearer supersecret" \
-  -H "X-User-ID: developer-1" \
+  -H "X-OpenWebUI-User-Id: developer-1" \
   -d '{"model": "llama3", "messages": [{"role": "user", "content": "Hi"}]}'
 
 # ...or with X-API-Key
