@@ -772,6 +772,22 @@ fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
     available.iter().any(|m| name_matches_listed(requested, m))
 }
 
+fn sorted_model_names(models: &HashSet<String>) -> Vec<String> {
+    let mut names: Vec<String> = models.iter().cloned().collect();
+    names.sort();
+    names
+}
+
+fn sorted_endpoint_hits(endpoints: &HashSet<String>, endpoint: &str) -> Vec<String> {
+    let mut hits: Vec<String> = endpoints
+        .iter()
+        .filter(|e| e.as_str() == endpoint)
+        .cloned()
+        .collect();
+    hits.sort();
+    hits
+}
+
 /// True when the requested model is resident on this backend per its latest
 /// probe: either in `loaded_models` (Ollama `/api/ps`, LM Studio loaded
 /// instance keys/ids) or — for LM Studio — a native-list entry with loaded
@@ -1028,6 +1044,7 @@ async fn health_check_round(
         |(idx, url, token, was_online, skip)| {
             let client = client.clone();
             async move {
+                let api_ps_skipped = skip.contains("/api/ps");
                 let probe = crate::control::probe_backend(
                     &client,
                     &url,
@@ -1036,14 +1053,14 @@ async fn health_check_round(
                     probe_timeout,
                 )
                 .await;
-                (idx, url, was_online, probe)
+                (idx, url, was_online, api_ps_skipped, probe)
             }
         },
     ))
     .await;
 
     let mut any_changed = false;
-    for (idx, url, was_online, probe) in probes {
+    for (idx, url, was_online, api_ps_skipped, probe) in probes {
         let mut backends = state.backends.lock_or_recover();
         let Some(b) = backends.get_mut(idx) else {
             continue;
@@ -1072,7 +1089,21 @@ async fn health_check_round(
 
         let was_api_type = b.api_type;
         let now_online = probe.is_online;
+        let api_ps_good_endpoints = sorted_endpoint_hits(&probe.good_endpoints, "/api/ps");
+        let api_ps_bad_endpoints = sorted_endpoint_hits(&probe.bad_endpoints, "/api/ps");
         crate::control::apply_probe(b, probe);
+        debug!(
+            "health probe applied backend={} loaded_state_known={} loaded_models={:?} available_models={:?} current_model={:?} api_ps_skipped={} api_ps_known_bad={} api_ps_good_endpoints={:?} api_ps_bad_endpoints={:?}",
+            url,
+            b.loaded_state_known,
+            sorted_model_names(&b.loaded_models),
+            sorted_model_names(&b.available_models),
+            b.current_model,
+            api_ps_skipped,
+            b.known_bad_endpoints.contains("/api/ps"),
+            api_ps_good_endpoints,
+            api_ps_bad_endpoints
+        );
 
         if !was_online && now_online {
             info!("Backend {} status changed to: ONLINE", url);
@@ -1388,6 +1419,40 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     );
                                     tier2
                                 } else {
+                                    for &i in &eligible_indices {
+                                        let b = &backends[i];
+                                        let loaded_on = model_loaded_on(b, model);
+                                        let direct_loaded_match =
+                                            model_routable(model, &b.loaded_models);
+                                        let mut reasons = Vec::new();
+                                        if !b.loaded_state_known {
+                                            reasons.push("loaded_state_known_false_would_be_tier1");
+                                        }
+                                        if !loaded_on {
+                                            reasons.push("model_loaded_on_false");
+                                        }
+                                        if b.loaded_state_known && b.loaded_models.is_empty() {
+                                            reasons.push("loaded_models_empty_would_be_cold");
+                                        }
+                                        if b.loaded_state_known
+                                            && !b.loaded_models.is_empty()
+                                            && !loaded_on
+                                        {
+                                            reasons.push("eligible_but_different_loaded_model");
+                                        }
+                                        debug!(
+                                            "loaded-model scheduler diagnostic backend={} requested_model='{}' loaded_state_known={} loaded_models={:?} current_model={:?} active_requests={} model_loaded_on={} direct_loaded_models_match={} reason_not_selected_as_already_loaded={:?}",
+                                            b.url,
+                                            model,
+                                            b.loaded_state_known,
+                                            sorted_model_names(&b.loaded_models),
+                                            b.current_model,
+                                            b.active_requests,
+                                            loaded_on,
+                                            direct_loaded_match,
+                                            reasons
+                                        );
+                                    }
                                     warn!(
                                         "no backend has model '{}' loaded and every eligible backend has a different model loaded; falling back to on-demand load (may evict a loaded model)",
                                         model
