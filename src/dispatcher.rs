@@ -8,8 +8,9 @@ use axum::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     fs,
+    hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
 };
@@ -1875,15 +1876,23 @@ pub async fn proxy_handler(
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
     let ip = addr.ip();
-    let user_id = request_user_id(&headers);
+    let (user_id, user_id_source) = request_user_identity(&headers);
+    let user_hash = user_id_hash_prefix(&user_id);
+    debug!(
+        "user identity selected: source={} user_hash={}",
+        user_id_source, user_hash
+    );
 
     if state.is_ip_blocked(&ip) {
-        warn!("Blocked request from IP: {} for user: {}", ip, user_id);
+        warn!(
+            "Blocked request from IP: {} for user_hash: {}",
+            ip, user_hash
+        );
         return (StatusCode::FORBIDDEN, "IP blocked").into_response();
     }
 
     if state.is_user_blocked(&user_id) {
-        warn!("Blocked request from user: {} (IP: {})", user_id, ip);
+        warn!("Blocked request from user_hash: {} (IP: {})", user_hash, ip);
         return (StatusCode::FORBIDDEN, "User blocked").into_response();
     }
 
@@ -2096,13 +2105,23 @@ pub async fn proxy_handler(
     }
 }
 
-fn request_user_id(headers: &HeaderMap) -> String {
-    headers
+fn request_user_identity(headers: &HeaderMap) -> (String, &'static str) {
+    if let Some(user_id) = headers
         .get("X-OpenWebUI-User-Id")
-        .or_else(|| headers.get("X-User-ID"))
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_string()
+    {
+        return (user_id.to_string(), "openwebui_user_id");
+    }
+    if let Some(user_id) = headers.get("X-User-ID").and_then(|h| h.to_str().ok()) {
+        return (user_id.to_string(), "x_user_id");
+    }
+    ("anonymous".to_string(), "fallback")
+}
+
+fn user_id_hash_prefix(user_id: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    user_id.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())[..8].to_string()
 }
 
 #[cfg(test)]
@@ -2769,6 +2788,27 @@ mod tests {
         let queues = state.queues.lock_or_recover();
         assert!(queues.contains_key("openwebui"));
         assert!(!queues.contains_key("legacy"));
+    }
+
+    #[test]
+    fn user_identity_source_and_hash_are_log_safe() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-OpenWebUI-User-Id", "person@example.com".parse().unwrap());
+        headers.insert("X-User-ID", "legacy-user".parse().unwrap());
+
+        let (user_id, source) = request_user_identity(&headers);
+        assert_eq!(source, "openwebui_user_id");
+        assert_eq!(user_id, "person@example.com");
+
+        let hash = user_id_hash_prefix(&user_id);
+        assert_eq!(hash.len(), 8);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(hash, "person@example.com");
+
+        let mut legacy_headers = HeaderMap::new();
+        legacy_headers.insert("X-User-ID", "legacy-user".parse().unwrap());
+        assert_eq!(request_user_identity(&legacy_headers).1, "x_user_id");
+        assert_eq!(request_user_identity(&HeaderMap::new()).1, "fallback");
     }
 
     #[tokio::test]

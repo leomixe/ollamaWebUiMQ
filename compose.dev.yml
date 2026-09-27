@@ -6,11 +6,15 @@ services:
 
     working_dir: /workspace
 
+    environment:
+      SSH_AUTH_SOCK: /ssh-agent
+
     volumes:
       - .:/workspace
       - ollamawebuimq-cargo:/root/.cargo
       - ollamawebuimq-rustup:/root/.rustup
       - ollamawebuimq-codex:/root/.codex
+      - ${SSH_AUTH_SOCK}:/ssh-agent
 
     networks:
       - llmnet
